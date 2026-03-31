@@ -50,7 +50,8 @@ actual suspend fun muxToMkv(
     subtitles: List<Pair<String, String>>,
     fonts: List<String>,
     metadataPath: String?,
-    outputPath: String
+    outputPath: String,
+    inputHeaders: Map<String, String>?
 ): Boolean = withContext(Dispatchers.IO) {
     try {
         val ffmpegPath = try {
@@ -60,6 +61,26 @@ actual suspend fun muxToMkv(
         }
 
         val args = mutableListOf(ffmpegPath, "-y")
+
+        // Handle HLS/Stream Headers
+        inputHeaders?.let { headers ->
+            val referer = headers["Referer"] ?: headers["referer"]
+            if (referer != null) {
+                args.add("-referer"); args.add(referer)
+            }
+            
+            val userAgent = headers["User-Agent"] ?: headers["user-agent"]
+            if (userAgent != null) {
+                args.add("-user_agent"); args.add(userAgent)
+            }
+
+            val otherHeaders = headers.filterKeys { it.lowercase() != "referer" && it.lowercase() != "user-agent" }
+            if (otherHeaders.isNotEmpty()) {
+                val headerStrings = otherHeaders.map { "${it.key}: ${it.value}" }.joinToString("\r\n") + "\r\n"
+                args.add("-headers"); args.add(headerStrings)
+            }
+        }
+
         args.add("-i"); args.add(videoPath)
         if (audioPath != null) {
             args.add("-i"); args.add(audioPath)
@@ -106,10 +127,23 @@ actual suspend fun muxToMkv(
             .redirectErrorStream(true)
             .start()
         
+        // Consume output stream to prevent blocking on Windows
+        val outputReader = Thread {
+            try {
+                process.inputStream.bufferedReader().forEachLine { line ->
+                    println("[FFmpeg] $line")
+                }
+            } catch (e: Exception) {
+                // Stream closed, ignore
+            }
+        }
+        outputReader.start()
+        
         val exitCode = process.waitFor()
+        outputReader.join(1000) // Wait up to 1 second for output thread to finish
+        
         if (exitCode != 0) {
-            val error = process.inputStream.bufferedReader().readText()
-            println("[FFmpeg] Error ($exitCode): $error")
+            println("[FFmpeg] Process exited with code $exitCode")
         }
         exitCode == 0
     } catch (e: Exception) {

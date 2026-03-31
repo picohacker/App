@@ -1,5 +1,9 @@
 package to.kuudere.anisuge.platform
 import to.kuudere.anisuge.BuildConfig
+import okio.Sink
+import okio.sink
+import okio.buffer
+import java.io.File
 
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.staticCompositionLocalOf
@@ -72,26 +76,8 @@ internal actual fun internalOpenUrl(url: String) {
     }
 }
 
-actual fun pickFolder(onPathSelected: (String) -> Unit) {
-    try {
-        // Run on AWT thread
-        java.awt.EventQueue.invokeLater {
-            val chooser = javax.swing.JFileChooser().apply {
-                fileSelectionMode = javax.swing.JFileChooser.DIRECTORIES_ONLY
-                dialogTitle = "Select Download Folder"
-                isAcceptAllFileFilterUsed = false
-            }
-            
-            // Try to set current path if possible
-            val result = chooser.showOpenDialog(null)
-            if (result == javax.swing.JFileChooser.APPROVE_OPTION) {
-                onPathSelected(chooser.selectedFile.absolutePath)
-            }
-        }
-    } catch (e: Exception) {
-        e.printStackTrace()
-    }
-}
+
+
 
 actual fun isFolderWritable(path: String): Boolean {
     if (path.isBlank()) return true
@@ -113,4 +99,23 @@ actual fun updateDownloadNotification(activeTasksCount: Int, totalProgress: Floa
 
 actual fun clearDownloadNotification() {
     // No-op for desktop
+}
+
+actual fun persistFolderPermission(path: String) {
+    // No-op for desktop
+}
+
+actual object KmpFileSystem {
+    actual fun exists(path: String): Boolean = File(path).exists()
+    actual fun createDirectories(path: String, mustCreate: Boolean) {
+        val f = File(path)
+        if (!f.exists()) f.mkdirs()
+    }
+    actual fun sink(path: String, append: Boolean): Sink = File(path).sink(append)
+    actual fun delete(path: String, mustExist: Boolean) {
+        File(path).delete()
+    }
+    actual fun write(path: String, data: ByteArray) {
+        File(path).writeBytes(data)
+    }
 }

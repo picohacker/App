@@ -1,4 +1,8 @@
 package to.kuudere.anisuge.platform
+import okio.Sink
+import okio.sink
+import okio.buffer
+import androidx.documentfile.provider.DocumentFile
 
 import android.app.Activity
 import android.content.Context
@@ -6,51 +10,17 @@ import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import android.net.Uri
 import android.content.Intent
 import androidx.compose.ui.platform.LocalContext
-import to.kuudere.anisuge.MainActivity
-import android.provider.DocumentsContract
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.os.Build
+import android.net.Uri
 import androidx.core.app.NotificationCompat
-import android.graphics.BitmapFactory
+import to.kuudere.anisuge.MainActivity
 import to.kuudere.anisuge.R
 import to.kuudere.anisuge.services.DownloadService
-
-var currentMainActivity: MainActivity? = null
-var onFolderPickedCallback: ((String) -> Unit)? = null
-
-fun getPathFromUri(uri: android.net.Uri): String? {
-    if (uri.scheme == "file") return uri.path
-    if (uri.scheme == "content") {
-        val docId = try { DocumentsContract.getTreeDocumentId(uri) } catch (e: Exception) { null }
-        if (docId != null && docId.startsWith("primary:")) {
-            val relativePath = docId.substringAfter("primary:")
-            val path = "${android.os.Environment.getExternalStorageDirectory()}/$relativePath"
-            
-            // Basic write check on Android
-            try {
-                val testFile = java.io.File(path, ".anisug_test")
-                if (testFile.createNewFile()) {
-                    testFile.delete()
-                    return path
-                }
-            } catch (e: Exception) {
-                // Not writable via standard File APIs
-                android.widget.Toast.makeText(
-                    androidAppContext,
-                    "Access restricted. Try choosing a subfolder in 'Downloads'.",
-                    android.widget.Toast.LENGTH_LONG
-                ).show()
-            }
-            return path
-        }
-    }
-    return null
-}
-
+import android.provider.DocumentsContract
 
 actual val isDesktopPlatform: Boolean = false
 actual val PlatformName: String = "Android"
@@ -121,13 +91,42 @@ actual fun SyncFullscreen(isFullscreen: Boolean) {
     // Android is mostly handled by LockScreenOrientation's insets controller
 }
 
-actual fun pickFolder(onPathSelected: (String) -> Unit) {
-    onFolderPickedCallback = onPathSelected
-    currentMainActivity?.openFolderPicker()
-}
+
+
 
 actual fun isFolderWritable(path: String): Boolean {
     if (path.isEmpty()) return true
+    
+    // Support SAF URIs for SD Cards/Scoped Storage
+    if (path.startsWith("content://")) {
+        return try {
+            val uri = Uri.parse(path)
+            // Check if it's a tree URI
+            if (DocumentsContract.isTreeUri(uri)) {
+                // Check persisted permissions first (efficient)
+                val hasPersisted = androidAppContext.contentResolver.persistedUriPermissions.any { 
+                    it.uri == uri && it.isWritePermission 
+                }
+                if (hasPersisted) return true
+                
+                // If not persisted, check if we can actually write right now
+                // We'll use DocumentFile if available, or try a test write if we had a document URI.
+                // For trees, DocumentFile is the standard way.
+                val document = androidx.documentfile.provider.DocumentFile.fromTreeUri(androidAppContext, uri)
+                document?.canWrite() ?: false
+            } else {
+                // Single document URI
+                val document = androidx.documentfile.provider.DocumentFile.fromSingleUri(androidAppContext, uri)
+                document?.canWrite() ?: false
+            }
+        } catch (e: Exception) {
+            // If DocumentFile is missing from classpath, this might throw NoClassDefFoundError
+            // but we'll add the dependency next.
+            e.printStackTrace()
+            false
+        }
+    }
+
     val file = java.io.File(path)
     return try {
         val testFile = java.io.File(file, ".anisug_test_write")
@@ -139,6 +138,119 @@ actual fun isFolderWritable(path: String): Boolean {
         }
     } catch (e: Exception) {
         false
+    }
+}
+
+actual fun persistFolderPermission(path: String) {
+    if (path.startsWith("content://")) {
+        try {
+            val uri = Uri.parse(path)
+            if (DocumentsContract.isTreeUri(uri)) {
+                androidAppContext.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+}
+
+actual object KmpFileSystem {
+    actual fun exists(path: String): Boolean {
+        if (path.startsWith("content://")) {
+            val doc = getDocumentFromPath(path)
+            return doc?.exists() == true
+        }
+        return java.io.File(path).exists()
+    }
+
+    actual fun createDirectories(path: String, mustCreate: Boolean) {
+        if (path.startsWith("content://")) {
+           getOrCreateDocumentFromPath(path, isDirectory = true)
+           return
+        }
+        val f = java.io.File(path)
+        if (!f.exists()) f.mkdirs()
+    }
+
+    actual fun sink(path: String, append: Boolean): Sink {
+        if (path.startsWith("content://")) {
+            val doc = getOrCreateDocumentFromPath(path, isDirectory = false)
+            val uri = doc?.uri ?: throw java.io.IOException("Could not create/open $path")
+            val pfd = androidAppContext.contentResolver.openFileDescriptor(uri, if (append) "wa" else "w")
+                ?: throw java.io.IOException("Failed to open file descriptor for $path")
+            return android.os.ParcelFileDescriptor.AutoCloseOutputStream(pfd).sink()
+        }
+        return java.io.File(path).sink(append)
+    }
+
+    actual fun delete(path: String, mustExist: Boolean) {
+        if (path.startsWith("content://")) {
+            val doc = getDocumentFromPath(path)
+            doc?.delete()
+            return
+        }
+        java.io.File(path).delete()
+    }
+
+    actual fun write(path: String, data: ByteArray) {
+        if (path.startsWith("content://")) {
+            val doc = getOrCreateDocumentFromPath(path, isDirectory = false)
+            doc?.uri?.let { uri ->
+                androidAppContext.contentResolver.openOutputStream(uri)?.use { 
+                    it.write(data) 
+                }
+            }
+            return
+        }
+        java.io.File(path).writeBytes(data)
+    }
+
+    private fun getDocumentFromPath(path: String): DocumentFile? {
+        val uri = Uri.parse(path)
+        return if (DocumentsContract.isTreeUri(uri)) {
+            DocumentFile.fromTreeUri(androidAppContext, uri)
+        } else {
+            DocumentFile.fromSingleUri(androidAppContext, uri)
+        }
+    }
+
+    // This is a naive implementation: it assumes the path string for URIs was constructed 
+    // by appending segments to a base URI, which is what DownloadManager does.
+    private fun getOrCreateDocumentFromPath(path: String, isDirectory: Boolean): DocumentFile? {
+        if (!path.startsWith("content://")) return null
+        
+        // 1. Find the base tree URI (the part we have permission for)
+        val persisted = androidAppContext.contentResolver.persistedUriPermissions
+            .filter { it.isWritePermission }
+            .map { it.uri.toString() }
+            .find { path.startsWith(it) } ?: return null
+            
+        var currentDoc = DocumentFile.fromTreeUri(androidAppContext, Uri.parse(persisted)) ?: return null
+        
+        // 2. Extract relative path and traverse
+        val relative = path.removePrefix(persisted).trim('/')
+        if (relative.isEmpty()) return currentDoc
+        
+        val segments = relative.split("/")
+        for (i in segments.indices) {
+            val name = segments[i]
+            if (name.isEmpty()) continue
+            
+            val nextDoc = currentDoc.findFile(name)
+            currentDoc = if (nextDoc != null) {
+                nextDoc
+            } else {
+                if (i == segments.size - 1 && !isDirectory) {
+                    currentDoc.createFile("application/octet-stream", name) ?: return null
+                } else {
+                    currentDoc.createDirectory(name) ?: return null
+                }
+            }
+        }
+        return currentDoc
     }
 }
 

@@ -6,9 +6,12 @@ import android.net.Uri
 import android.provider.DocumentsContract
 import to.kuudere.anisuge.platform.androidAppContext
 import io.microshow.rxffmpeg.RxFFmpegInvoke
+import io.microshow.rxffmpeg.RxFFmpegCommandList
 import java.io.File
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
@@ -126,65 +129,149 @@ actual fun openDirectory(path: String) {
     }
 }
 
+private val ffmpegMutex = Mutex()
+
 actual suspend fun muxToMkv(
     videoPath: String,
     audioPath: String?,
     subtitles: List<Pair<String, String>>,
     fonts: List<String>,
     metadataPath: String?,
-    outputPath: String
+    outputPath: String,
+    inputHeaders: Map<String, String>?
 ): Boolean = withContext(Dispatchers.IO) {
-    val cmdArray = mutableListOf("ffmpeg", "-y")
-    cmdArray.add("-i"); cmdArray.add(videoPath)
-    if (audioPath != null) {
-        cmdArray.add("-i"); cmdArray.add(audioPath)
-    }
-    subtitles.forEach { (path, _) ->
-        cmdArray.add("-i"); cmdArray.add(path)
-    }
+    val cmd = RxFFmpegCommandList()
+    val openFds = mutableListOf<android.os.ParcelFileDescriptor>()
     
-    val metadataIndex = if (metadataPath != null) {
-        val index = 1 + (if (audioPath != null) 1 else 0) + subtitles.size
-        cmdArray.add("-i"); cmdArray.add(metadataPath)
-        index
-    } else -1
-
-    // Mapping
-    cmdArray.add("-map"); cmdArray.add("0:v")
-    if (audioPath != null) {
-        cmdArray.add("-map"); cmdArray.add("1:a")
-    } else {
-        cmdArray.add("-map"); cmdArray.add("0:a?")
+    fun getFfPath(path: String, mode: String = "r"): String {
+        if (path.startsWith("content://")) {
+            return try {
+                val uri = Uri.parse(path)
+                val pfd = androidAppContext.contentResolver.openFileDescriptor(uri, mode)
+                if (pfd != null) {
+                    openFds.add(pfd)
+                    "/proc/self/fd/${pfd.fd}"
+                } else path
+            } catch (e: Exception) {
+                path
+            }
+        }
+        return path
     }
 
-    subtitles.forEachIndexed { i, _ ->
-        val index = if (audioPath != null) i + 2 else i + 1
-        cmdArray.add("-map"); cmdArray.add("$index:s")
-    }
-
-    if (metadataIndex != -1) {
-        cmdArray.add("-map_metadata"); cmdArray.add("$metadataIndex")
-    }
-
-    // Attach fonts
-    fonts.forEach { fontPath ->
-        cmdArray.add("-attach"); cmdArray.add(fontPath)
-    }
-    cmdArray.add("-metadata:s:t"); cmdArray.add("mimetype=application/x-truetype-font")
-
-    subtitles.forEachIndexed { i, (_, label) ->
-        cmdArray.add("-metadata:s:s:$i")
-        cmdArray.add("title=$label")
-    }
-
-    cmdArray.add("-c"); cmdArray.add("copy")
-    cmdArray.add(outputPath)
-
-    // Using runCommand with null subscriber
+    var success = false
     try {
-        val response = RxFFmpegInvoke.getInstance().runCommand(cmdArray.toTypedArray(), null)
-        response == 0
+        cmd.append("-hide_banner")
+        cmd.append("-v"); cmd.append("debug")
+        cmd.append("-ignore_unknown")
+
+        // Handle HLS/Stream Headers
+        inputHeaders?.let { headers ->
+            val referer = headers["Referer"] ?: headers["referer"]
+            if (referer != null) {
+                cmd.append("-referer"); cmd.append(referer)
+            }
+            
+            val userAgent = headers["User-Agent"] ?: headers["user-agent"]
+            if (userAgent != null) {
+                cmd.append("-user_agent"); cmd.append(userAgent)
+            }
+
+            val otherHeaders = headers.filterKeys { it.lowercase() != "referer" && it.lowercase() != "user-agent" }
+            if (otherHeaders.isNotEmpty()) {
+                val headerStrings = otherHeaders.map { "${it.key}: ${it.value}" }.joinToString("\r\n") + "\r\n"
+                cmd.append("-headers"); cmd.append(headerStrings)
+            }
+        }
+        
+        cmd.append("-fflags"); cmd.append("+genpts")
+        cmd.append("-y")
+        
+        // Inputs
+        cmd.append("-i"); cmd.append(getFfPath(videoPath))
+        if (audioPath != null) {
+            cmd.append("-i"); cmd.append(getFfPath(audioPath))
+        }
+        subtitles.forEach { (path, _) ->
+            cmd.append("-i"); cmd.append(getFfPath(path))
+        }
+        
+        val metadataIndex = if (metadataPath != null) {
+            val index = 1 + (if (audioPath != null) 1 else 0) + subtitles.size
+            cmd.append("-i"); cmd.append(getFfPath(metadataPath))
+            index
+        } else -1
+
+        // Mapping
+        cmd.append("-map"); cmd.append("0:v")
+        if (audioPath != null) {
+            cmd.append("-map"); cmd.append("1:a")
+        } else {
+            cmd.append("-map"); cmd.append("0:a?")
+        }
+
+        subtitles.forEachIndexed { i, _ ->
+            val index = if (audioPath != null) i + 2 else i + 1
+            cmd.append("-map"); cmd.append("$index:s")
+        }
+
+        if (metadataIndex != -1) {
+            cmd.append("-map_metadata"); cmd.append("0:g:$metadataIndex")
+            cmd.append("-map_chapters"); cmd.append("$metadataIndex")
+        }
+
+        if (subtitles.isNotEmpty()) {
+            fonts.forEachIndexed { i, fontPath ->
+                cmd.append("-attach"); cmd.append(getFfPath(fontPath))
+                cmd.append("-metadata:s:t:$i"); cmd.append("mimetype=application/x-truetype-font")
+            }
+        }
+
+        subtitles.forEachIndexed { i, (_, label) ->
+            val safeLabel = label.replace("[^A-Za-z0-9]".toRegex(), "_")
+            cmd.append("-metadata:s:s:$i"); cmd.append("title=$safeLabel")
+        }
+
+        cmd.append("-c:v"); cmd.append("copy")
+        cmd.append("-c:a"); cmd.append("copy")
+        
+        if (subtitles.isNotEmpty()) {
+            cmd.append("-c:s"); cmd.append("copy")
+        }
+        
+        cmd.append("-max_muxing_queue_size"); cmd.append("1024")
+        cmd.append(getFfPath(outputPath, "rwt"))
+
+        val cmdArray = cmd.build()
+        cmdArray.forEachIndexed { i, arg -> println("FFmpeg Arg[$i]: '$arg'") }
+        
+        success = ffmpegMutex.withLock {
+            RxFFmpegInvoke.getInstance().setDebug(true)
+            
+            val isRemote = videoPath.startsWith("http://") || videoPath.startsWith("https://")
+            if (!isRemote) {
+                val videoFile = File(videoPath)
+                if (!videoFile.exists() || videoFile.length() == 0L) {
+                    println("FFmpeg Error: Video input file is missing or empty: $videoPath")
+                    return@withContext false
+                }
+            }
+
+            val dummyListener = object : io.microshow.rxffmpeg.RxFFmpegInvoke.IFFmpegListener {
+                override fun onFinish() {}
+                override fun onProgress(progress: Int, progressTime: Long) {}
+                override fun onCancel() {}
+                override fun onError(message: String?) {}
+            }
+            
+            val response = RxFFmpegInvoke.getInstance().runCommand(cmdArray, dummyListener)
+            response == 0
+        }
+        success
     } catch (e: Exception) {
+        e.printStackTrace()
         false
+    } finally {
+        openFds.forEach { try { it.close() } catch (ex: Exception) {} }
     }
 }
